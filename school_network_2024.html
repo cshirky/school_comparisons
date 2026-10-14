@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IPEDS custom comparison groups</title>
+<link rel="stylesheet" href="lib/vis-9.1.2/vis-network.css">
+<link rel="stylesheet" href="lib/tom-select/tom-select.css">
+<script src="lib/vis-9.1.2/vis-network.min.js"></script>
+<script src="lib/tom-select/tom-select.complete.min.js"></script>
+<style>
+html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222; }
+#mynetwork { position: fixed; inset: 0; background: #fff; }
+#loadingOverlay {
+    position: fixed; inset: 0;
+    background: rgba(255,255,255,0.85);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    font: 18px Arial, sans-serif; color: #333; z-index: 9999; text-align: center;
+}
+#loadingOverlay small { font-size: 13px; color: #666; max-width: 520px; }
+#loadingOverlay button { font: 14px Arial, sans-serif; padding: 4px 12px; }
+#filterPanel {
+    position: fixed; top: 12px; left: 12px; width: 330px;
+    background: #fff; border: 1px solid #bbb; border-radius: 6px;
+    padding: 10px 14px; font: 13px Arial, sans-serif;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15); z-index: 1000;
+    display: flex; flex-direction: column; gap: 6px;
+}
+#filterPanel label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+#dataStatus { color: #666; font-size: 12px; line-height: 1.5; border-top: 1px solid #ddd; padding-top: 6px; }
+#dataStatus button { font: 12px Arial, sans-serif; margin-top: 4px; }
+#tip {
+    position: fixed; background: #fff; border: 1px solid #aaa; border-radius: 5px;
+    padding: 8px 10px; font: 12px Arial, sans-serif; line-height: 1.7;
+    max-height: 500px; overflow-y: auto; z-index: 10000; display: none;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.18); pointer-events: none; white-space: nowrap;
+}
+</style>
+</head>
+<body>
+<div id="mynetwork"></div>
+
+<div id="loadingOverlay">
+  <div id="loadingText">Loading&hellip;</div>
+  <small id="loadingDetail"></small>
+</div>
+
+<div id="filterPanel">
+  <select id="schoolSearch" placeholder="Find a school&hellip;"></select>
+  <strong style="margin-bottom:2px">Filters</strong>
+  <label><input type="checkbox" id="cb_bidir"> Show only schools with bidirectional links</label>
+  <label><input type="checkbox" id="cb_outbound"> Omit schools with zero outbound links</label>
+  <label><input type="checkbox" id="cb_bidir_net"> Only show network held together by bidirectional links</label>
+  <div id="dataStatus"></div>
+</div>
+
+<div id="tip"></div>
+
+<!-- ── Data loader: NCES zip → Access database → comparison-group table ─────── -->
+<script id="ipedsLoader">
+var IPEDS = (function () {
+    // NCES serves these with Access-Control-Allow-Origin: *, so the browser can
+    // fetch them directly. Final replaces Provisional once NCES revises the year.
+    var ZIP_URLS = [
+        'https://nces.ed.gov/ipeds/tablefiles/zipfiles/IPEDS_2024-25_Final.zip',
+        'https://nces.ed.gov/ipeds/tablefiles/zipfiles/IPEDS_2024-25_Provisional.zip'
+    ];
+    var PAGE = 4096;          // Access 2007+ page size
+    var CATALOG_TDEF = 2;     // MSysObjects table definition always lives on page 2
+
+    async function download(urls, onProgress) {
+        var lastErr;
+        for (var url of urls) {
+            try {
+                var resp = await fetch(url);
+                if (!resp.ok) { lastErr = new Error('HTTP ' + resp.status + ' from ' + url); continue; }
+                var total = Number(resp.headers.get('content-length')) || 0;
+                var reader = resp.body.getReader();
+                var chunks = [], got = 0;
+                for (;;) {
+                    var r = await reader.read();
+                    if (r.done) break;
+                    chunks.push(r.value);
+                    got += r.value.length;
+                    onProgress('download', got, total);
+                }
+                return { blob: new Blob(chunks), url: url, lastModified: resp.headers.get('last-modified') };
+            } catch (e) { lastErr = e; }
+        }
+        throw lastErr || new Error('No download URL worked');
+    }
+
+    // ── Zip: find the .accdb entry via the central directory ─────────────────
+    async function locateAccdb(blob) {
+        var tailStart = Math.max(0, blob.size - 65557);
+        var tail = new DataView(await blob.slice(tailStart).arrayBuffer());
+        var eocd = -1;
+        for (var i = tail.byteLength - 22; i >= 0; i--) {
+            if (tail.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('Not a zip file');
+        var cdSize = tail.getUint32(eocd + 12, true), cdOffset = tail.getUint32(eocd + 16, true);
+        var cd = new DataView(await blob.slice(cdOffset, cdOffset + cdSize).arrayBuffer());
+        var dec = new TextDecoder();
+        for (var p = 0; p + 46 <= cd.byteLength && cd.getUint32(p, true) === 0x02014b50;) {
+            var nameLen = cd.getUint16(p + 28, true);
+            var name = dec.decode(new Uint8Array(cd.buffer, p + 46, nameLen));
+            if (/\.accdb$/i.test(name)) {
+                var local = cd.getUint32(p + 42, true);
+                var lh = new DataView(await blob.slice(local, local + 30).arrayBuffer());
+                var dataStart = local + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+                return {
+                    name: name, method: cd.getUint16(p + 10, true), start: dataStart,
+                    compSize: cd.getUint32(p + 20, true), size: cd.getUint32(p + 24, true)
+                };
+            }
+            p += 46 + nameLen + cd.getUint16(p + 30, true) + cd.getUint16(p + 32, true);
+        }
+        throw new Error('No .accdb file inside the zip');
+    }
+
+    // ── Stream the database one 4 KB page at a time (never holds all 600 MB) ─
+    async function eachPage(blob, entry, onPage, onProgress) {
+        var stream = blob.slice(entry.start, entry.start + entry.compSize).stream();
+        if (entry.method === 8) stream = stream.pipeThrough(new DecompressionStream('deflate-raw'));
+        else if (entry.method !== 0) throw new Error('Unsupported zip compression method ' + entry.method);
+        var reader = stream.getReader();
+        var carry = new Uint8Array(PAGE), fill = 0, pageNo = 0, seen = 0;
+        for (;;) {
+            var r = await reader.read();
+            if (r.done) break;
+            var v = r.value, p = 0;
+            while (p < v.length) {
+                if (fill === 0 && v.length - p >= PAGE) {
+                    onPage(v.subarray(p, p + PAGE), pageNo++);
+                    p += PAGE;
+                } else {
+                    var n = Math.min(PAGE - fill, v.length - p);
+                    carry.set(v.subarray(p, p + n), fill);
+                    fill += n; p += n;
+                    if (fill === PAGE) { onPage(carry, pageNo++); fill = 0; }
+                }
+            }
+            seen += v.length;
+            onProgress(seen, entry.size);
+        }
+    }
+
+    function u16(pg, o) { return pg[o] | (pg[o + 1] << 8); }
+    function u32(pg, o) { return (pg[o] | (pg[o + 1] << 8) | (pg[o + 2] << 16) | (pg[o + 3] << 24)) >>> 0; }
+
+    // ── Table definition (may continue across pages) ─────────────────────────
+    function parseTdef(tdefPages, pgNo) {
+        var parts = [], len = 0;
+        for (var p = pgNo, first = true; p; first = false) {
+            var pg = tdefPages.get(p);
+            if (!pg) throw new Error('Missing table definition page ' + p);
+            var part = first ? pg : pg.subarray(8);
+            parts.push(part); len += part.length;
+            p = u32(pg, 4);
+        }
+        var buf = new Uint8Array(len), at = 0;
+        parts.forEach(function (x) { buf.set(x, at); at += x.length; });
+
+        var numVarCols = u16(buf, 43), numCols = u16(buf, 45), numRealIdx = u32(buf, 51);
+        var o = 63 + numRealIdx * 12, cols = [];
+        for (var i = 0; i < numCols; i++, o += 25) {
+            cols.push({
+                type: buf[o], colNum: u16(buf, o + 5), varNum: u16(buf, o + 7),
+                fixed: !!(buf[o + 15] & 1), fixedOff: u16(buf, o + 21), len: u16(buf, o + 23)
+            });
+        }
+        var utf16 = new TextDecoder('utf-16le');
+        for (i = 0; i < numCols; i++) {
+            var n = u16(buf, o);
+            cols[i].name = utf16.decode(buf.subarray(o + 2, o + 2 + n));
+            o += 2 + n;
+        }
+        cols.sort(function (a, b) { return a.colNum - b.colNum; });
+        var ord = 0, byName = {};
+        cols.forEach(function (c) { if (c.fixed) c.fixedOrd = ord++; byName[c.name.toUpperCase()] = c; });
+        return { numVarCols: numVarCols, cols: cols, byName: byName };
+    }
+
+    var utf16le = new TextDecoder('utf-16le');
+    function decodeText(pg, start, end) {
+        if (end - start >= 2 && pg[start] === 0xff && pg[start + 1] === 0xfe) {
+            // "Unicode compression": one byte per char, 0x00 toggles to raw UTF-16
+            var s = '', compressed = true;
+            for (var i = start + 2; i < end;) {
+                if (pg[i] === 0) { compressed = !compressed; i++; }
+                else if (compressed) { s += String.fromCharCode(pg[i]); i++; }
+                else if (end - i >= 2) { s += String.fromCharCode(pg[i] | (pg[i + 1] << 8)); i += 2; }
+                else break;
+            }
+            return s;
+        }
+        return utf16le.decode(pg.subarray(start, end));
+    }
+
+    // ── Decode the wanted columns from every live row on one data page ───────
+    function readRows(pg, tdef, want, emit, stats) {
+        var dv = new DataView(pg.buffer, pg.byteOffset, PAGE);
+        var nrows = u16(pg, 12);
+        for (var r = 0; r < nrows; r++) {
+            var raw = u16(pg, 14 + r * 2);
+            // 0x4000: deleted, or a stub pointing at a row that moved to another page.
+            // 0x8000 alone marks the moved row itself, which is ordinary data.
+            if (raw & 0x4000) { stats.skipped++; continue; }
+            var start = raw & 0x1FFF;
+            var end = r === 0 ? PAGE : (u16(pg, 14 + (r - 1) * 2) & 0x1FFF);
+            if (end - start < 3) continue;
+            var rowCols = u16(pg, start);
+            var nullAt = end - ((rowCols + 7) >> 3);
+            var rowVar = 0, varBase = 0;
+            if (tdef.numVarCols > 0) { rowVar = u16(pg, nullAt - 2); varBase = nullAt - 4; }
+            var rowFixed = rowCols - rowVar;
+            var out = new Array(want.length);
+            for (var k = 0; k < want.length; k++) {
+                var c = want[k], val = null;
+                var notNull = c.colNum < rowCols && (pg[nullAt + (c.colNum >> 3)] & (1 << (c.colNum & 7)));
+                if (c.type === 1) val = !!notNull;
+                else if (!notNull) val = null;
+                else if (c.fixed) {
+                    if (c.fixedOrd < rowFixed) {
+                        var at = start + 2 + c.fixedOff;
+                        if (c.type === 4) val = dv.getInt32(at, true);
+                        else if (c.type === 3) val = dv.getInt16(at, true);
+                        else if (c.type === 2) val = pg[at];
+                        else if (c.type === 7) val = dv.getFloat64(at, true);
+                        else if (c.type === 6) val = dv.getFloat32(at, true);
+                    }
+                } else if (c.varNum < rowVar && (c.type === 10 || c.type === 12)) {
+                    var a = start + u16(pg, varBase - 2 * c.varNum);
+                    var b = start + u16(pg, varBase - 2 * (c.varNum + 1));
+                    if (c.type === 10) val = decodeText(pg, a, b).trim();
+                    // Memo: 12-byte header, then either the text itself (inline) or a
+                    // pointer to the row on another page that holds it.
+                    else if (b - a >= 12 && (pg[a + 3] & 0x80)) val = decodeText(pg, a + 12, b).trim();
+                    else if (b - a >= 12 && (pg[a + 3] & 0x40)) val = { lvalPage: pg[a + 5] | (pg[a + 6] << 8) | (pg[a + 7] << 16), lvalRow: pg[a + 4] };
+                }
+                out[k] = val;
+            }
+            emit(out);
+            stats.rows++;
+        }
+    }
+
+    function pick(tdef, names) {
+        return names.map(function (n) {
+            var c = tdef.byName[n.toUpperCase()];
+            if (!c) throw new Error('Column ' + n + ' not found');
+            return c;
+        });
+    }
+
+    // ── Blob of the NCES zip → { schools, out, ... } ─────────────────────────
+    async function parse(blob, onProgress) {
+        var entry = await locateAccdb(blob);
+
+        // Pass 1: table definitions + the catalog rows that name them
+        var tdefPages = new Map(), catalogPages = [];
+        await eachPage(blob, entry, function (pg, no) {
+            if (pg[0] === 2) tdefPages.set(no, pg.slice());
+            else if (pg[0] === 1 && u32(pg, 4) === CATALOG_TDEF) catalogPages.push(pg.slice());
+        }, function (a, b) { onProgress('catalog', a, b); });
+
+        var catalog = parseTdef(tdefPages, CATALOG_TDEF);
+        var tables = {}, stats = { rows: 0, skipped: 0 };
+        catalogPages.forEach(function (pg) {
+            readRows(pg, catalog, pick(catalog, ['Id', 'Name', 'Type']), function (row) {
+                if (row[2] === 1 && row[1]) tables[row[1].toUpperCase()] = row[0] & 0x00ffffff;
+            }, stats);
+        });
+        var names = Object.keys(tables).sort();
+        var cgName = names.filter(function (n) { return /^CUSTOMCGIDS\d{4}$/.test(n); }).pop();
+        var hdName = names.filter(function (n) { return /^HD\d{4}$/.test(n); }).pop();
+        var icName = names.filter(function (n) { return /^IC\d{4}$/.test(n); }).pop();
+        if (!cgName || !hdName || !icName) throw new Error('Missing CUSTOMCGIDS, HD or IC table in ' + entry.name);
+
+        var cg = parseTdef(tdefPages, tables[cgName]);
+        var cgCols = pick(cg, ['UNITID', 'CGUNITID']);
+        var hd = parseTdef(tdefPages, tables[hdName]);
+        var hdCols = pick(hd, ['UNITID', 'INSTNM', 'STABBR']);
+        var ic = parseTdef(tdefPages, tables[icName]);
+        var icCols = pick(ic, ['UNITID', 'LEVEL5']);   // LEVEL5 = 1: offers a bachelor's degree
+
+        // Pass 2: rows of the three tables we care about
+        var out = {}, hdInfo = {}, bachelors = new Set(), rows = 0, moved = new Map();
+        var cgStats = { rows: 0, skipped: 0 }, hdStats = { rows: 0, skipped: 0 }, icStats = { rows: 0, skipped: 0 };
+        await eachPage(blob, entry, function (pg) {
+            if (pg[0] !== 1) return;
+            var owner = u32(pg, 4);
+            if (owner === tables[cgName]) {
+                readRows(pg, cg, cgCols, function (row) {
+                    if (row[0] == null || row[1] == null) return;
+                    (out[row[0]] || (out[row[0]] = [])).push(row[1]);
+                    rows++;
+                }, cgStats);
+            } else if (owner === tables[icName]) {
+                readRows(pg, ic, icCols, function (row) {
+                    if (row[1] === 1) bachelors.add(row[0]);
+                }, icStats);
+            } else if (owner === tables[hdName]) {
+                readRows(pg, hd, hdCols, function (row) {
+                    if (row[0] == null || !row[1]) return;
+                    if (typeof row[1] === 'string') hdInfo[row[0]] = [row[1], row[2] || ''];
+                    else {
+                        if (!moved.has(row[1].lvalPage)) moved.set(row[1].lvalPage, []);
+                        moved.get(row[1].lvalPage).push({ id: row[0], row: row[1].lvalRow, st: row[2] || '' });
+                    }
+                }, hdStats);
+            }
+        }, function (a, b) { onProgress('rows', a, b); });
+
+        // Pass 3 (only if needed): names stored out-of-row on other pages
+        if (moved.size) {
+            await eachPage(blob, entry, function (pg, no) {
+                var list = moved.get(no);
+                if (!list || pg[0] !== 1) return;
+                list.forEach(function (m) {
+                    if (m.row >= u16(pg, 12)) return;
+                    var a = u16(pg, 14 + m.row * 2) & 0x1FFF;
+                    var b = m.row === 0 ? PAGE : (u16(pg, 14 + (m.row - 1) * 2) & 0x1FFF);
+                    var name = decodeText(pg, a, b).trim();
+                    if (name) hdInfo[m.id] = [name, m.st];
+                });
+            }, function (a, b) { onProgress('names', a, b); });
+        }
+
+        // Keep only schools that are in the directory (so have a name) and offer
+        // a bachelor's degree; links to anyone else are dropped. A kept school whose
+        // whole group was dropped stays in `out` with an empty list.
+        function keep(id) { return hdInfo[id] && bachelors.has(Number(id)); }
+        var schools = {}, keptOut = {}, all = new Set(), unnamed = 0, nonBachelors = 0;
+        Object.keys(out).forEach(function (src) {
+            all.add(src);
+            out[src].forEach(function (tgt) { all.add(String(tgt)); });
+            if (!keep(src)) return;
+            // Some schools list themselves; that is not a comparison, so drop it
+            keptOut[src] = Array.from(new Set(out[src])).filter(function (tgt) { return keep(tgt) && String(tgt) !== src; })
+                .sort(function (a, b) { return a - b; });
+        });
+        all.forEach(function (id) { if (!hdInfo[id]) unnamed++; else if (!bachelors.has(Number(id))) nonBachelors++; });
+        Object.keys(keptOut).forEach(function (src) {
+            schools[src] = hdInfo[src];
+            keptOut[src].forEach(function (tgt) { schools[tgt] = hdInfo[tgt]; });
+        });
+
+        return {
+            table: cgName, file: entry.name, schools: schools, out: keptOut, rows: rows,
+            filter: icName + ' LEVEL5', dropped: { unnamed: unnamed, nonBachelors: nonBachelors },
+            hdTable: hdName, hdRows: hdStats.rows, icRows: icStats.rows
+        };
+    }
+
+    async function load(onProgress) {
+        onProgress = onProgress || function () {};
+        var dl = await download(ZIP_URLS, onProgress);
+        var data = await parse(dl.blob, onProgress);
+        data.url = dl.url;
+        data.lastModified = dl.lastModified;
+        data.fetchedAt = new Date().toISOString();
+        return data;
+    }
+
+    return { load: load, parse: parse, ZIP_URLS: ZIP_URLS };
+})();
+</script>
+
+<!-- ── Page ──────────────────────────────────────────────────────────────── -->
+<script>
+(function () {
+    var DATA_KEY = 'ipedsCustomCG:data:v3';
+    var POS_KEY  = 'ipedsCustomCG:positions:v3';
+    Object.keys(localStorage).forEach(function (k) {         // drop caches from older versions
+        if (k.indexOf('ipedsCustomCG:') === 0 && k !== DATA_KEY && k !== POS_KEY) localStorage.removeItem(k);
+    });
+
+    var overlay = document.getElementById('loadingOverlay');
+    var loadingText = document.getElementById('loadingText');
+    var loadingDetail = document.getElementById('loadingDetail');
+    function status(text, detail) { loadingText.textContent = text; loadingDetail.textContent = detail || ''; }
+    function mb(n) { return (n / 1048576).toFixed(0); }
+    function pct(a, b) { return b ? Math.floor(100 * a / b) + '%' : ''; }
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    function readCache(key) {
+        try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
+    }
+    function writeCache(key, value) {
+        try { localStorage.setItem(key, JSON.stringify(value)); return true; }
+        catch (e) { console.warn('Could not cache ' + key, e); return false; }
+    }
+
+    function onProgress(stage, a, b) {
+        if (stage === 'download') status('Downloading IPEDS database from NCES…', mb(a) + (b ? ' of ' + mb(b) : '') + ' MB');
+        else if (stage === 'catalog') status('Reading table catalog…', pct(a, b));
+        else if (stage === 'names') status('Reading school names…', pct(a, b));
+        else status('Extracting comparison groups…', pct(a, b));
+    }
+
+    async function start(force) {
+        var data = force ? null : readCache(DATA_KEY);
+        if (!data || !data.out || !data.schools) {
+            try {
+                data = await IPEDS.load(onProgress);
+            } catch (e) {
+                console.error(e);
+                status('Could not load the data from NCES', String(e && e.message || e));
+                var retry = document.createElement('button');
+                retry.textContent = 'Try again';
+                retry.onclick = function () { location.reload(); };
+                overlay.appendChild(retry);
+                return;
+            }
+            writeCache(DATA_KEY, data);
+            localStorage.removeItem(POS_KEY);
+        }
+        render(data);
+    }
+
+    function render(data) {
+        // ── Graph structure ──────────────────────────────────────────────────
+        var outMap = {}, inMap = {}, edgeCount = 0;
+        Object.keys(data.schools).forEach(function (id) { outMap[id] = new Set(); inMap[id] = new Set(); });
+        Object.keys(data.out).forEach(function (src) {
+            data.out[src].forEach(function (tgt) {
+                tgt = String(tgt);
+                outMap[src].add(tgt); inMap[tgt].add(src); edgeCount++;
+            });
+        });
+        var outboundSet = new Set(Object.keys(data.out));
+        var bidirSet = new Set();
+        outboundSet.forEach(function (src) {
+            outMap[src].forEach(function (tgt) {
+                if (outMap[tgt].has(src)) { bidirSet.add(src); bidirSet.add(tgt); }
+            });
+        });
+
+        var sig = data.table + ':' + edgeCount + ':' + data.fetchedAt;
+        var saved = readCache(POS_KEY);
+        var positions = saved && saved.sig === sig ? saved.positions : null;
+
+        var nodeList = Object.keys(data.schools).map(function (id) {
+            var color = !outboundSet.has(id) ? '#d3d3d3' : (bidirSet.has(id) ? '#2171b5' : '#add8e6');
+            var node = { id: id, label: data.schools[id][0], color: color, size: 8, shape: 'dot' };
+            if (positions && positions[id]) { node.x = positions[id][0]; node.y = positions[id][1]; }
+            return node;
+        });
+
+        var edgeList = [], baseEdgeData = {};
+        outboundSet.forEach(function (src) {
+            outMap[src].forEach(function (tgt) {
+                var both = outMap[tgt].has(src);
+                if (both && src > tgt) return;   // draw each mutual pair once
+                var id = src + '>' + tgt;
+                var arrows = { to: { enabled: true, scaleFactor: 0.3 } };
+                if (both) arrows.from = { enabled: true, scaleFactor: 0.3 };
+                edgeList.push({ id: id, from: src, to: tgt, color: both ? 'red' : 'black', width: both ? 1.5 : 0.5, arrows: arrows });
+                baseEdgeData[id] = { width: both ? 1.5 : 0.5, toScale: 0.3, fromEnabled: both };
+            });
+        });
+
+        var nodes = new vis.DataSet(nodeList), edges = new vis.DataSet(edgeList);
+        var network = new vis.Network(document.getElementById('mynetwork'), { nodes: nodes, edges: edges }, {
+            nodes: { font: { size: 9, face: 'Arial', background: 'rgba(255,255,255,0.3)' }, borderWidth: 1 },
+            edges: { smooth: { enabled: false } },
+            layout: { improvedLayout: false, randomSeed: 42 },
+            physics: positions ? { enabled: false } : {
+                enabled: true,
+                solver: 'forceAtlas2Based',
+                forceAtlas2Based: {
+                    gravitationalConstant: -220, centralGravity: 0.004,
+                    springLength: 160, springConstant: 0.03, damping: 0.6, avoidOverlap: 0.6
+                },
+                maxVelocity: 80, minVelocity: 2,
+                stabilization: { enabled: true, iterations: 400, updateInterval: 10, fit: true }
+            },
+            interaction: {
+                hover: true, tooltipDelay: 999999, navigationButtons: true, keyboard: true,
+                zoomView: true, dragView: true, hideEdgesOnDrag: true, hideEdgesOnZoom: true
+            }
+        });
+
+        // ── Layout: computed once, then cached alongside the data ────────────
+        function done() {
+            network.setOptions({ physics: { enabled: false } });
+            overlay.style.display = 'none';
+        }
+        if (positions) {
+            network.once('afterDrawing', done);
+        } else {
+            status('Laying out ' + nodeList.length.toLocaleString() + ' schools…', '');
+            network.on('stabilizationProgress', function (p) {
+                loadingDetail.textContent = pct(p.iterations, p.total);
+            });
+            network.once('stabilizationIterationsDone', function () {
+                done();
+                var pos = network.getPositions(), compact = {};
+                Object.keys(pos).forEach(function (id) { compact[id] = [Math.round(pos[id].x), Math.round(pos[id].y)]; });
+                writeCache(POS_KEY, { sig: sig, positions: compact });
+            });
+        }
+
+        // ── Data status + refresh ────────────────────────────────────────────
+        var statusEl = document.getElementById('dataStatus');
+        statusEl.innerHTML =
+            '<b>' + esc(data.table) + '</b> from <a href="' + esc(data.url) + '">NCES IPEDS</a><br>' +
+            'Bachelor\u2019s-granting schools only<br>' +
+            outboundSet.size.toLocaleString() + ' schools submitted a group · ' +
+            nodeList.length.toLocaleString() + ' schools · ' + edgeCount.toLocaleString() + ' links<br>' +
+            'Cached ' + esc(new Date(data.fetchedAt).toLocaleString()) + '<br>';
+        var refresh = document.createElement('button');
+        refresh.textContent = 'Refresh from NCES';
+        refresh.onclick = function () {
+            if (!confirm('Download the IPEDS database again (about 65 MB)?')) return;
+            localStorage.removeItem(DATA_KEY);
+            localStorage.removeItem(POS_KEY);
+            location.reload();
+        };
+        statusEl.appendChild(refresh);
+
+        // ── School search ────────────────────────────────────────────────────
+        new TomSelect('#schoolSearch', {
+            options: Object.keys(data.schools).map(function (id) {
+                var s = data.schools[id];
+                return { value: id, text: s[0] + (s[1] ? ' (' + s[1] + ')' : '') };
+            }),
+            maxOptions: 100,
+            sortField: { field: 'text', direction: 'asc' },
+            onChange: function (id) {
+                if (!id) { network.unselectAll(); return; }
+                if (nodes.get(id).hidden) nodes.update({ id: id, hidden: false });
+                network.selectNodes([id]);
+                network.focus(id, { scale: 1.2, animation: { duration: 600 } });
+            }
+        });
+
+        // ── Apply all checkboxes ─────────────────────────────────────────────
+        function applyFilters() {
+            var onlyBidir      = document.getElementById('cb_bidir').checked;
+            var omitNoOutbound = document.getElementById('cb_outbound').checked;
+            var onlyBidirNet   = document.getElementById('cb_bidir_net').checked;
+
+            nodes.update(nodeList.map(function (node) {
+                var visible = true;
+                if ((onlyBidir || onlyBidirNet) && !bidirSet.has(node.id))    visible = false;
+                if (omitNoOutbound              && !outboundSet.has(node.id)) visible = false;
+                return { id: node.id, hidden: !visible };
+            }));
+
+            // cb_bidir_net hides all one-way (black) edges
+            edges.update(edgeList.map(function (edge) {
+                return { id: edge.id, hidden: onlyBidirNet && !baseEdgeData[edge.id].fromEnabled };
+            }));
+        }
+        ['cb_bidir', 'cb_outbound', 'cb_bidir_net'].forEach(function (id) {
+            document.getElementById(id).addEventListener('change', applyFilters);
+        });
+
+        // ── Custom tooltip ───────────────────────────────────────────────────
+        var tipEl = document.getElementById('tip');
+        function buildTipHTML(nid) {
+            var outSet = outMap[nid], inSet = inMap[nid];
+            var items = [];
+            new Set([...outSet, ...inSet]).forEach(function (otherId) {
+                var isOut = outSet.has(otherId), isIn = inSet.has(otherId);
+                var pfx = (isOut && isIn) ? 'X' : (isOut ? '<' : '>');
+                items.push({ pfx: pfx, nm: data.schools[otherId][0], bidir: isOut && isIn });
+            });
+            items.sort(function (a, b) { return a.nm.localeCompare(b.nm); });
+            var head = '<b>' + esc(data.schools[nid][0]) + '</b><br>' +
+                '<span style="color:#666">lists ' + outSet.size + ' · listed by ' + inSet.size + '</span><br>';
+            return head + items.map(function (i) {
+                var line = esc(i.pfx) + ' ' + esc(i.nm);
+                return i.bidir ? '<b>' + line + '</b>' : line;
+            }).join('<br>');
+        }
+
+        var mX = 0, mY = 0;
+        function placeTip() {
+            tipEl.style.left = (mX + 18) + 'px';
+            tipEl.style.top  = Math.max(4, Math.min(mY - 10, window.innerHeight - tipEl.offsetHeight - 10)) + 'px';
+        }
+        document.addEventListener('mousemove', function (e) {
+            mX = e.clientX; mY = e.clientY;
+            if (tipEl.style.display !== 'none') placeTip();
+        });
+        network.on('hoverNode', function (p) {
+            tipEl.innerHTML = buildTipHTML(String(p.node));
+            tipEl.style.display = 'block';
+            placeTip();
+        });
+        network.on('blurNode', function () { tipEl.style.display = 'none'; });
+
+        // ── Zoom handler: shrink edges and arrows as you zoom in ─────────────
+        var zoomTimer = null;
+        network.on('zoom', function (params) {
+            clearTimeout(zoomTimer);
+            zoomTimer = setTimeout(function () {
+                var scale = params.scale;
+                edges.update(edgeList.map(function (edge) {
+                    var base = baseEdgeData[edge.id];
+                    var as = Math.max(0.02, base.toScale / scale);
+                    var upd = { id: edge.id, width: Math.max(0.05, base.width / scale), arrows: { to: { enabled: true, scaleFactor: as } } };
+                    if (base.fromEnabled) upd.arrows.from = { enabled: true, scaleFactor: as };
+                    return upd;
+                }));
+            }, 250);
+        });
+
+        window.schoolNetwork = { network: network, nodes: nodes, edges: edges, data: data };
+    }
+
+    start(false);
+})();
+</script>
+</body>
+</html>
