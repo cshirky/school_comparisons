@@ -26,6 +26,9 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
     display: flex; flex-direction: column; gap: 6px;
 }
 #filterPanel label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+#filterTab { cursor: default; color: #444; }
+#filterBody { display: none; flex-direction: column; gap: 6px; padding-top: 4px; }
+#filters:hover #filterBody { display: flex; }
 #dataStatus { color: #666; font-size: 12px; line-height: 1.5; border-top: 1px solid #ddd; padding-top: 6px; }
 #dataStatus button { font: 12px Arial, sans-serif; margin-top: 4px; }
 #tip {
@@ -46,11 +49,15 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
 
 <div id="filterPanel">
   <select id="schoolSearch" placeholder="Find a school&hellip;"></select>
-  <strong style="margin-bottom:2px">Filters</strong>
-  <label><input type="checkbox" id="cb_bidir"> Show only schools with bidirectional links</label>
-  <label><input type="checkbox" id="cb_outbound"> Omit schools with zero outbound links</label>
-  <label><input type="checkbox" id="cb_bidir_net"> Only show network held together by bidirectional links</label>
-  <div id="dataStatus"></div>
+  <div id="filters">
+    <strong id="filterTab">Filters &#9662;</strong>
+    <div id="filterBody">
+      <label><input type="checkbox" id="cb_bidir" checked> Show only schools with bidirectional links</label>
+      <label><input type="checkbox" id="cb_outbound" checked> Omit schools with zero outbound links</label>
+      <label><input type="checkbox" id="cb_bidir_net" checked> Only show network held together by bidirectional links</label>
+      <div id="dataStatus"></div>
+    </div>
+  </div>
 </div>
 
 <div id="tip"></div>
@@ -441,23 +448,54 @@ var IPEDS = (function () {
         var saved = readCache(POS_KEY);
         var positions = saved && saved.sig === sig ? saved.positions : null;
 
+        // ── Filter state (checkboxes) and the styling that depends on it ─────
+        function filterState() {
+            return {
+                onlyBidir:      document.getElementById('cb_bidir').checked,
+                omitNoOutbound: document.getElementById('cb_outbound').checked,
+                onlyBidirNet:   document.getElementById('cb_bidir_net').checked
+            };
+        }
+        function nodeHidden(id, f) {
+            if ((f.onlyBidir || f.onlyBidirNet) && !bidirSet.has(id)) return true;
+            return f.omitNoOutbound && !outboundSet.has(id);
+        }
+        // Widths and arrows stay a constant on-screen size once the user zooms;
+        // with only mutual links showing, arrowheads say nothing, so drop them.
+        var currentScale = null, baseEdgeData = {};
+        function edgeStyle(id, f) {
+            var base = baseEdgeData[id];
+            var as = currentScale ? Math.max(0.02, base.toScale / currentScale) : base.toScale;
+            return {
+                id: id,
+                hidden: f.onlyBidirNet && !base.fromEnabled,
+                width: currentScale ? Math.max(0.05, base.width / currentScale) : base.width,
+                arrows: {
+                    to:   { enabled: !f.onlyBidirNet, scaleFactor: as },
+                    from: { enabled: base.fromEnabled && !f.onlyBidirNet, scaleFactor: as }
+                }
+            };
+        }
+
+        var initial = filterState();
         var nodeList = Object.keys(data.schools).map(function (id) {
-            var color = !outboundSet.has(id) ? '#d3d3d3' : (bidirSet.has(id) ? '#2171b5' : '#add8e6');
-            var node = { id: id, label: data.schools[id][0], color: color, size: 8, shape: 'dot' };
+            var color = !outboundSet.has(id) ? '#a9bfd8' : (bidirSet.has(id) ? '#1565c0' : '#5b9bd5');
+            var node = { id: id, label: data.schools[id][0], color: color, size: 12, shape: 'dot', hidden: nodeHidden(id, initial) };
             if (positions && positions[id]) { node.x = positions[id][0]; node.y = positions[id][1]; }
             return node;
         });
 
-        var edgeList = [], baseEdgeData = {};
+        var edgeList = [];
         outboundSet.forEach(function (src) {
             outMap[src].forEach(function (tgt) {
                 var both = outMap[tgt].has(src);
                 if (both && src > tgt) return;   // draw each mutual pair once
                 var id = src + '>' + tgt;
-                var arrows = { to: { enabled: true, scaleFactor: 0.3 } };
-                if (both) arrows.from = { enabled: true, scaleFactor: 0.3 };
-                edgeList.push({ id: id, from: src, to: tgt, color: both ? 'red' : 'black', width: both ? 1.5 : 0.5, arrows: arrows });
-                baseEdgeData[id] = { width: both ? 1.5 : 0.5, toScale: 0.3, fromEnabled: both };
+                baseEdgeData[id] = { width: both ? 0.8 : 0.5, toScale: 0.3, fromEnabled: both };
+                var edge = edgeStyle(id, initial);
+                edge.from = src; edge.to = tgt;
+                edge.color = both ? 'rgba(196, 78, 82, 0.6)' : 'black';   // c) muted, narrower red
+                edgeList.push(edge);
             });
         });
 
@@ -538,21 +576,10 @@ var IPEDS = (function () {
 
         // ── Apply all checkboxes ─────────────────────────────────────────────
         function applyFilters() {
-            var onlyBidir      = document.getElementById('cb_bidir').checked;
-            var omitNoOutbound = document.getElementById('cb_outbound').checked;
-            var onlyBidirNet   = document.getElementById('cb_bidir_net').checked;
-
-            nodes.update(nodeList.map(function (node) {
-                var visible = true;
-                if ((onlyBidir || onlyBidirNet) && !bidirSet.has(node.id))    visible = false;
-                if (omitNoOutbound              && !outboundSet.has(node.id)) visible = false;
-                return { id: node.id, hidden: !visible };
-            }));
-
-            // cb_bidir_net hides all one-way (black) edges
-            edges.update(edgeList.map(function (edge) {
-                return { id: edge.id, hidden: onlyBidirNet && !baseEdgeData[edge.id].fromEnabled };
-            }));
+            var f = filterState();
+            nodes.update(nodeList.map(function (node) { return { id: node.id, hidden: nodeHidden(node.id, f) }; }));
+            // cb_bidir_net hides all one-way (black) edges and the arrowheads
+            edges.update(edgeList.map(function (edge) { return edgeStyle(edge.id, f); }));
         }
         ['cb_bidir', 'cb_outbound', 'cb_bidir_net'].forEach(function (id) {
             document.getElementById(id).addEventListener('change', applyFilters);
@@ -598,14 +625,9 @@ var IPEDS = (function () {
         network.on('zoom', function (params) {
             clearTimeout(zoomTimer);
             zoomTimer = setTimeout(function () {
-                var scale = params.scale;
-                edges.update(edgeList.map(function (edge) {
-                    var base = baseEdgeData[edge.id];
-                    var as = Math.max(0.02, base.toScale / scale);
-                    var upd = { id: edge.id, width: Math.max(0.05, base.width / scale), arrows: { to: { enabled: true, scaleFactor: as } } };
-                    if (base.fromEnabled) upd.arrows.from = { enabled: true, scaleFactor: as };
-                    return upd;
-                }));
+                currentScale = params.scale;
+                var f = filterState();
+                edges.update(edgeList.map(function (edge) { return edgeStyle(edge.id, f); }));
             }, 250);
         });
 
