@@ -29,6 +29,8 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
 #filterTab { cursor: default; color: #444; }
 #filterBody { display: none; flex-direction: column; gap: 6px; padding-top: 4px; }
 #filters:hover #filterBody { display: flex; }
+#legend { font-size: 12px; line-height: 1.6; color: #444; }
+#legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; }
 #dataStatus { color: #666; font-size: 12px; line-height: 1.5; border-top: 1px solid #ddd; padding-top: 6px; }
 #dataStatus button { font: 12px Arial, sans-serif; margin-top: 4px; }
 #tip {
@@ -55,6 +57,14 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
       <label><input type="checkbox" id="cb_bidir" checked> Show only schools with bidirectional links</label>
       <label><input type="checkbox" id="cb_outbound" checked> Omit schools with zero outbound links</label>
       <label><input type="checkbox" id="cb_bidir_net" checked> Only show network held together by bidirectional links</label>
+      <label><input type="checkbox" id="cb_same_sector"> One-way links only within a sector (public &rarr; public, private &rarr; private)</label>
+      <label><input type="checkbox" id="cb_cross_sector"> One-way links only between public and private, either direction</label>
+      <div id="legend">
+        <div><i style="background:rgba(196,78,82,0.6)"></i>Mutual: each lists the other</div>
+        <div><i style="background:#555555"></i>One-way, public &rarr; public or private &rarr; private</div>
+        <div><i style="background:#e8871e"></i>One-way, public &rarr; private</div>
+        <div><i style="background:#2b6cd4"></i>One-way, private &rarr; public</div>
+      </div>
       <div id="dataStatus"></div>
     </div>
   </div>
@@ -287,7 +297,7 @@ var IPEDS = (function () {
         var cg = parseTdef(tdefPages, tables[cgName]);
         var cgCols = pick(cg, ['UNITID', 'CGUNITID']);
         var hd = parseTdef(tdefPages, tables[hdName]);
-        var hdCols = pick(hd, ['UNITID', 'INSTNM', 'STABBR']);
+        var hdCols = pick(hd, ['UNITID', 'INSTNM', 'STABBR', 'CONTROL']);   // CONTROL 1 = public, 2/3 = private
         var ic = parseTdef(tdefPages, tables[icName]);
         var icCols = pick(ic, ['UNITID', 'LEVEL5']);   // LEVEL5 = 1: offers a bachelor's degree
 
@@ -310,10 +320,10 @@ var IPEDS = (function () {
             } else if (owner === tables[hdName]) {
                 readRows(pg, hd, hdCols, function (row) {
                     if (row[0] == null || !row[1]) return;
-                    if (typeof row[1] === 'string') hdInfo[row[0]] = [row[1], row[2] || ''];
+                    if (typeof row[1] === 'string') hdInfo[row[0]] = [row[1], row[2] || '', row[3]];
                     else {
                         if (!moved.has(row[1].lvalPage)) moved.set(row[1].lvalPage, []);
-                        moved.get(row[1].lvalPage).push({ id: row[0], row: row[1].lvalRow, st: row[2] || '' });
+                        moved.get(row[1].lvalPage).push({ id: row[0], row: row[1].lvalRow, st: row[2] || '', control: row[3] });
                     }
                 }, hdStats);
             }
@@ -329,7 +339,7 @@ var IPEDS = (function () {
                     var a = u16(pg, 14 + m.row * 2) & 0x1FFF;
                     var b = m.row === 0 ? PAGE : (u16(pg, 14 + (m.row - 1) * 2) & 0x1FFF);
                     var name = decodeText(pg, a, b).trim();
-                    if (name) hdInfo[m.id] = [name, m.st];
+                    if (name) hdInfo[m.id] = [name, m.st, m.control];
                 });
             }, function (a, b) { onProgress('names', a, b); });
         }
@@ -377,8 +387,8 @@ var IPEDS = (function () {
 <!-- ── Page ──────────────────────────────────────────────────────────────── -->
 <script>
 (function () {
-    var DATA_KEY = 'ipedsCustomCG:data:v3';
-    var POS_KEY  = 'ipedsCustomCG:positions:v3';
+    var DATA_KEY = 'ipedsCustomCG:data:v4';
+    var POS_KEY  = 'ipedsCustomCG:positions:v4';
     Object.keys(localStorage).forEach(function (k) {         // drop caches from older versions
         if (k.indexOf('ipedsCustomCG:') === 0 && k !== DATA_KEY && k !== POS_KEY) localStorage.removeItem(k);
     });
@@ -453,7 +463,9 @@ var IPEDS = (function () {
             return {
                 onlyBidir:      document.getElementById('cb_bidir').checked,
                 omitNoOutbound: document.getElementById('cb_outbound').checked,
-                onlyBidirNet:   document.getElementById('cb_bidir_net').checked
+                onlyBidirNet:   document.getElementById('cb_bidir_net').checked,
+                sameSectorOnly: document.getElementById('cb_same_sector').checked,
+                crossSectorOnly: document.getElementById('cb_cross_sector').checked
             };
         }
         function nodeHidden(id, f) {
@@ -468,13 +480,22 @@ var IPEDS = (function () {
             var as = currentScale ? Math.max(0.02, base.toScale / currentScale) : base.toScale;
             return {
                 id: id,
-                hidden: f.onlyBidirNet && !base.fromEnabled,
+                hidden: !base.fromEnabled && (f.onlyBidirNet ||
+                        (f.sameSectorOnly && base.crossSector) || (f.crossSectorOnly && !base.crossSector)),
                 width: currentScale ? Math.max(0.05, base.width / currentScale) : base.width,
                 arrows: {
                     to:   { enabled: !f.onlyBidirNet, scaleFactor: as },
                     from: { enabled: base.fromEnabled && !f.onlyBidirNet, scaleFactor: as }
                 }
             };
+        }
+
+        // One-way links: grey within a sector, orange public → private, blue private → public.
+        // For-profit schools count as private.
+        function isPublic(id) { return data.schools[id][2] === 1; }
+        function oneWayColor(src, tgt) {
+            if (isPublic(src) === isPublic(tgt)) return '#555555';
+            return isPublic(src) ? '#e8871e' : '#2b6cd4';
         }
 
         var initial = filterState();
@@ -491,10 +512,10 @@ var IPEDS = (function () {
                 var both = outMap[tgt].has(src);
                 if (both && src > tgt) return;   // draw each mutual pair once
                 var id = src + '>' + tgt;
-                baseEdgeData[id] = { width: both ? 0.8 : 0.5, toScale: 0.3, fromEnabled: both };
+                baseEdgeData[id] = { width: both ? 0.8 : 0.5, toScale: 0.3, fromEnabled: both, crossSector: isPublic(src) !== isPublic(tgt) };
                 var edge = edgeStyle(id, initial);
                 edge.from = src; edge.to = tgt;
-                edge.color = both ? 'rgba(196, 78, 82, 0.6)' : 'black';   // c) muted, narrower red
+                edge.color = both ? 'rgba(196, 78, 82, 0.6)' : oneWayColor(src, tgt);
                 edgeList.push(edge);
             });
         });
@@ -578,11 +599,22 @@ var IPEDS = (function () {
         function applyFilters() {
             var f = filterState();
             nodes.update(nodeList.map(function (node) { return { id: node.id, hidden: nodeHidden(node.id, f) }; }));
-            // cb_bidir_net hides all one-way (black) edges and the arrowheads
+            // cb_bidir_net hides all one-way edges and the arrowheads; the two
+            // sector boxes hide one-way edges within or across sectors
             edges.update(edgeList.map(function (edge) { return edgeStyle(edge.id, f); }));
         }
-        ['cb_bidir', 'cb_outbound', 'cb_bidir_net'].forEach(function (id) {
+        ['cb_bidir', 'cb_outbound'].forEach(function (id) {
             document.getElementById(id).addEventListener('change', applyFilters);
+        });
+        // The three one-way-link boxes contradict each other, so checking one clears the others
+        var oneWayModes = ['cb_bidir_net', 'cb_same_sector', 'cb_cross_sector'];
+        oneWayModes.forEach(function (id) {
+            document.getElementById(id).addEventListener('change', function (e) {
+                if (e.target.checked) {
+                    oneWayModes.forEach(function (other) { if (other !== id) document.getElementById(other).checked = false; });
+                }
+                applyFilters();
+            });
         });
 
         // ── Custom tooltip ───────────────────────────────────────────────────
