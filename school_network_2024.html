@@ -29,8 +29,10 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
 #filterTab { cursor: default; color: #444; }
 #filterBody { display: none; flex-direction: column; gap: 6px; padding-top: 4px; }
 #filters:hover #filterBody { display: flex; }
-#legend { font-size: 12px; line-height: 1.6; color: #444; }
-#legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; }
+#filterBody i { display: inline-block; flex: none; width: 18px; height: 3px; }
+#filterBody .gap { margin-top: 4px; }
+#schoolKey { display: flex; gap: 12px; font-size: 12px; color: #444; }
+#schoolKey b { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
 #dataStatus { color: #666; font-size: 12px; line-height: 1.5; border-top: 1px solid #ddd; padding-top: 6px; }
 #dataStatus button { font: 12px Arial, sans-serif; margin-top: 4px; }
 #tip {
@@ -54,17 +56,16 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
   <div id="filters">
     <strong id="filterTab">Filters &#9662;</strong>
     <div id="filterBody">
-      <label><input type="checkbox" id="cb_bidir" checked> Show only schools with bidirectional links</label>
-      <label><input type="checkbox" id="cb_outbound" checked> Omit schools with zero outbound links</label>
-      <label><input type="checkbox" id="cb_bidir_net" checked> Only show network held together by bidirectional links</label>
-      <label><input type="checkbox" id="cb_same_sector"> One-way links only within a sector (public &rarr; public, private &rarr; private)</label>
-      <label><input type="checkbox" id="cb_cross_sector"> One-way links only between public and private, either direction</label>
-      <div id="legend">
-        <div><i style="background:rgba(196,78,82,0.6)"></i>Mutual: each lists the other</div>
-        <div><i style="background:#555555"></i>One-way, public &rarr; public or private &rarr; private</div>
-        <div><i style="background:#e8871e"></i>One-way, public &rarr; private</div>
-        <div><i style="background:#2b6cd4"></i>One-way, private &rarr; public</div>
-      </div>
+      <div id="schoolKey"><span><b style="background:#2e9e4f"></b>Public</span><span><b style="background:#1565c0"></b>Private non-profit</span><span><b style="background:#b5462f"></b>For-profit</span></div>
+      <label><input type="checkbox" id="cb_noOutbound"> Show schools with no outbound links</label>
+      <label><input type="checkbox" id="cb_forProfit" checked> Show for-profits</label>
+      <label class="gap"><input type="checkbox" id="cb_mutualPublic" checked><i style="background:rgba(196,78,82,0.6)"></i> Show public bidirectional links</label>
+      <label><input type="checkbox" id="cb_mutualPrivate" checked><i style="background:rgba(196,78,82,0.6)"></i> Show private bidirectional links</label>
+      <label><input type="checkbox" id="cb_mutualMixed" checked><i style="background:rgba(196,78,82,0.6)"></i> Show public&ndash;private bidirectional links</label>
+      <label class="gap"><input type="checkbox" id="cb_pubPub"><i style="background:#555555"></i> Show public &rarr; public directed links</label>
+      <label><input type="checkbox" id="cb_privPriv"><i style="background:#555555"></i> Show private &rarr; private directed links</label>
+      <label><input type="checkbox" id="cb_pubPriv"><i style="background:#e8871e"></i> Show public &rarr; private directed links</label>
+      <label><input type="checkbox" id="cb_privPub"><i style="background:#2b6cd4"></i> Show private &rarr; public directed links</label>
       <div id="dataStatus"></div>
     </div>
   </div>
@@ -447,77 +448,82 @@ var IPEDS = (function () {
             });
         });
         var outboundSet = new Set(Object.keys(data.out));
-        var bidirSet = new Set();
-        outboundSet.forEach(function (src) {
-            outMap[src].forEach(function (tgt) {
-                if (outMap[tgt].has(src)) { bidirSet.add(src); bidirSet.add(tgt); }
-            });
-        });
 
         var sig = data.table + ':' + edgeCount + ':' + data.fetchedAt;
         var saved = readCache(POS_KEY);
-        var positions = saved && saved.sig === sig ? saved.positions : null;
+        // A saved layout missing any school is redone (earlier versions laid out
+        // only the schools visible at the time, leaving the rest in a ring)
+        var positions = saved && saved.sig === sig &&
+            Object.keys(data.schools).every(function (id) { return saved.positions[id]; }) ? saved.positions : null;
 
-        // ── Filter state (checkboxes) and the styling that depends on it ─────
+        // ── Link kinds and the checkboxes that show/hide them ────────────────
+        // For-profit schools count as private.
+        function isPublic(id) { return data.schools[id][2] === 1; }
+        function linkKind(src, tgt, mutual) {
+            var a = isPublic(src), b = isPublic(tgt);
+            if (mutual) return a && b ? 'mutualPublic' : (!a && !b ? 'mutualPrivate' : 'mutualMixed');
+            return a ? (b ? 'pubPub' : 'pubPriv') : (b ? 'privPub' : 'privPriv');
+        }
+        var KIND_COLORS = {
+            mutualPublic: 'rgba(196, 78, 82, 0.6)', mutualPrivate: 'rgba(196, 78, 82, 0.6)', mutualMixed: 'rgba(196, 78, 82, 0.6)',
+            pubPub: '#555555', privPriv: '#555555', pubPriv: '#e8871e', privPub: '#2b6cd4'
+        };
+
+        // Every box is independent: one per link kind, plus one for schools
+        // that didn't submit a group
         function filterState() {
-            return {
-                onlyBidir:      document.getElementById('cb_bidir').checked,
-                omitNoOutbound: document.getElementById('cb_outbound').checked,
-                onlyBidirNet:   document.getElementById('cb_bidir_net').checked,
-                sameSectorOnly: document.getElementById('cb_same_sector').checked,
-                crossSectorOnly: document.getElementById('cb_cross_sector').checked
-            };
+            var f = {};
+            ['noOutbound', 'forProfit'].concat(Object.keys(KIND_COLORS)).forEach(function (k) {
+                f[k] = document.getElementById('cb_' + k).checked;
+            });
+            return f;
         }
-        function nodeHidden(id, f) {
-            if ((f.onlyBidir || f.onlyBidirNet) && !bidirSet.has(id)) return true;
-            return f.omitNoOutbound && !outboundSet.has(id);
+        function schoolAllowed(id, f) {
+            if (!f.forProfit && data.schools[id][2] === 3) return false;
+            return f.noOutbound || outboundSet.has(id);
         }
-        // Widths and arrows stay a constant on-screen size once the user zooms;
-        // with only mutual links showing, arrowheads say nothing, so drop them.
+        function edgeShown(id, f) {
+            var b = baseEdgeData[id];
+            return f[b.kind] && schoolAllowed(b.from, f) && schoolAllowed(b.to, f);
+        }
+        // Widths and arrows stay a constant on-screen size once the user zooms.
+        // Mutual links get no arrowheads: they point both ways, so arrows say nothing.
         var currentScale = null, baseEdgeData = {};
         function edgeStyle(id, f) {
             var base = baseEdgeData[id];
             var as = currentScale ? Math.max(0.02, base.toScale / currentScale) : base.toScale;
             return {
                 id: id,
-                hidden: !base.fromEnabled && (f.onlyBidirNet ||
-                        (f.sameSectorOnly && base.crossSector) || (f.crossSectorOnly && !base.crossSector)),
+                hidden: !edgeShown(id, f),
                 width: currentScale ? Math.max(0.05, base.width / currentScale) : base.width,
-                arrows: {
-                    to:   { enabled: !f.onlyBidirNet, scaleFactor: as },
-                    from: { enabled: base.fromEnabled && !f.onlyBidirNet, scaleFactor: as }
-                }
+                arrows: { to: { enabled: !base.mutual, scaleFactor: as }, from: { enabled: false } }
             };
         }
-
-        // One-way links: grey within a sector, orange public → private, blue private → public.
-        // For-profit schools count as private.
-        function isPublic(id) { return data.schools[id][2] === 1; }
-        function oneWayColor(src, tgt) {
-            if (isPublic(src) === isPublic(tgt)) return '#555555';
-            return isPublic(src) ? '#e8871e' : '#2b6cd4';
-        }
-
-        var initial = filterState();
-        var nodeList = Object.keys(data.schools).map(function (id) {
-            var color = !outboundSet.has(id) ? '#a9bfd8' : (bidirSet.has(id) ? '#1565c0' : '#5b9bd5');
-            var node = { id: id, label: data.schools[id][0], color: color, size: 12, shape: 'dot', hidden: nodeHidden(id, initial) };
-            if (positions && positions[id]) { node.x = positions[id][0]; node.y = positions[id][1]; }
-            return node;
-        });
 
         var edgeList = [];
         outboundSet.forEach(function (src) {
             outMap[src].forEach(function (tgt) {
-                var both = outMap[tgt].has(src);
-                if (both && src > tgt) return;   // draw each mutual pair once
+                var mutual = outMap[tgt].has(src);
+                if (mutual && src > tgt) return;   // draw each mutual pair once
                 var id = src + '>' + tgt;
-                baseEdgeData[id] = { width: both ? 0.8 : 0.5, toScale: 0.3, fromEnabled: both, crossSector: isPublic(src) !== isPublic(tgt) };
-                var edge = edgeStyle(id, initial);
-                edge.from = src; edge.to = tgt;
-                edge.color = both ? 'rgba(196, 78, 82, 0.6)' : oneWayColor(src, tgt);
-                edgeList.push(edge);
+                var kind = linkKind(src, tgt, mutual);
+                baseEdgeData[id] = { from: src, to: tgt, kind: kind, mutual: mutual, width: mutual ? 0.8 : 0.5, toScale: 0.3 };
+                edgeList.push({ id: id, from: src, to: tgt, color: KIND_COLORS[kind] });
             });
+        });
+        // Hidden schools and links are left out of the layout, so lay out with
+        // everything showing and apply the checkboxes once it settles
+        // Schools by IPEDS CONTROL: 1 public, 2 private non-profit, 3 for-profit
+        var SCHOOL_COLORS = { 1: '#2e9e4f', 2: '#1565c0', 3: '#b5462f' };
+
+        var initial = filterState();
+        if (!positions) Object.keys(initial).forEach(function (k) { initial[k] = true; });
+        edgeList.forEach(function (edge) { Object.assign(edge, edgeStyle(edge.id, initial)); });
+
+        var nodeList = Object.keys(data.schools).map(function (id) {
+            var node = { id: id, label: data.schools[id][0], color: SCHOOL_COLORS[data.schools[id][2]] || '#999999', size: 15, shape: 'dot', hidden: !schoolAllowed(id, initial) };
+            if (positions && positions[id]) { node.x = positions[id][0]; node.y = positions[id][1]; }
+            return node;
         });
 
         var nodes = new vis.DataSet(nodeList), edges = new vis.DataSet(edgeList);
@@ -558,6 +564,7 @@ var IPEDS = (function () {
                 var pos = network.getPositions(), compact = {};
                 Object.keys(pos).forEach(function (id) { compact[id] = [Math.round(pos[id].x), Math.round(pos[id].y)]; });
                 writeCache(POS_KEY, { sig: sig, positions: compact });
+                applyFilters();
             });
         }
 
@@ -598,23 +605,11 @@ var IPEDS = (function () {
         // ── Apply all checkboxes ─────────────────────────────────────────────
         function applyFilters() {
             var f = filterState();
-            nodes.update(nodeList.map(function (node) { return { id: node.id, hidden: nodeHidden(node.id, f) }; }));
-            // cb_bidir_net hides all one-way edges and the arrowheads; the two
-            // sector boxes hide one-way edges within or across sectors
+            nodes.update(nodeList.map(function (node) { return { id: node.id, hidden: !schoolAllowed(node.id, f) }; }));
             edges.update(edgeList.map(function (edge) { return edgeStyle(edge.id, f); }));
         }
-        ['cb_bidir', 'cb_outbound'].forEach(function (id) {
-            document.getElementById(id).addEventListener('change', applyFilters);
-        });
-        // The three one-way-link boxes contradict each other, so checking one clears the others
-        var oneWayModes = ['cb_bidir_net', 'cb_same_sector', 'cb_cross_sector'];
-        oneWayModes.forEach(function (id) {
-            document.getElementById(id).addEventListener('change', function (e) {
-                if (e.target.checked) {
-                    oneWayModes.forEach(function (other) { if (other !== id) document.getElementById(other).checked = false; });
-                }
-                applyFilters();
-            });
+        document.querySelectorAll('#filterBody input[type=checkbox]').forEach(function (cb) {
+            cb.addEventListener('change', applyFilters);
         });
 
         // ── Custom tooltip ───────────────────────────────────────────────────
