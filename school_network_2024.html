@@ -41,6 +41,11 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
     max-height: 500px; overflow-y: auto; z-index: 10000; display: none;
     box-shadow: 0 3px 10px rgba(0,0,0,0.18); pointer-events: none; white-space: nowrap;
 }
+#targetLabels { position: fixed; inset: 0; pointer-events: none; z-index: 9000; overflow: hidden; }
+#targetLabels div {
+    position: absolute; background: rgba(255,255,255,0.9); border: 1px solid #bbb; border-radius: 3px;
+    padding: 0 4px; font: 11px Arial, sans-serif; line-height: 15px; white-space: nowrap; transform: translateY(-50%);
+}
 </style>
 </head>
 <body>
@@ -72,6 +77,7 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
 </div>
 
 <div id="tip"></div>
+<div id="targetLabels"></div>
 
 <!-- ── Data loader: NCES zip → Access database → comparison-group table ─────── -->
 <script id="ipedsLoader">
@@ -521,7 +527,7 @@ var IPEDS = (function () {
         edgeList.forEach(function (edge) { Object.assign(edge, edgeStyle(edge.id, initial)); });
 
         var nodeList = Object.keys(data.schools).map(function (id) {
-            var node = { id: id, label: data.schools[id][0], color: SCHOOL_COLORS[data.schools[id][2]] || '#999999', size: 15, shape: 'dot', hidden: !schoolAllowed(id, initial) };
+            var node = { id: id, label: data.schools[id][0], color: SCHOOL_COLORS[data.schools[id][2]] || '#999999', size: 22, shape: 'dot', hidden: !schoolAllowed(id, initial) };
             if (positions && positions[id]) { node.x = positions[id][0]; node.y = positions[id][1]; }
             return node;
         });
@@ -640,12 +646,41 @@ var IPEDS = (function () {
             mX = e.clientX; mY = e.clientY;
             if (tipEl.style.display !== 'none') placeTip();
         });
+        // Name labels beside each visible school the hovered school lists
+        var labelsEl = document.getElementById('targetLabels'), labelled = [];
+        function placeLabels() {
+            var r = network.getScale() * 22;
+            labelled.forEach(function (l) {
+                var p = network.canvasToDOM(network.getPosition(l.id));
+                l.el.style.left = (p.x + r + 3) + 'px';
+                l.el.style.top = p.y + 'px';
+            });
+        }
+        function showLabels(nid) {
+            labelled = [];
+            labelsEl.innerHTML = '';
+            outMap[nid].forEach(function (id) {
+                if (nodes.get(id).hidden) return;
+                var el = document.createElement('div');
+                el.textContent = data.schools[id][0];
+                labelsEl.appendChild(el);
+                labelled.push({ id: id, el: el });
+            });
+            placeLabels();
+        }
+        network.on('afterDrawing', function () { if (labelled.length) placeLabels(); });
+
         network.on('hoverNode', function (p) {
             tipEl.innerHTML = buildTipHTML(String(p.node));
             tipEl.style.display = 'block';
             placeTip();
+            showLabels(String(p.node));
         });
-        network.on('blurNode', function () { tipEl.style.display = 'none'; });
+        network.on('blurNode', function () {
+            tipEl.style.display = 'none';
+            labelled = [];
+            labelsEl.innerHTML = '';
+        });
 
         // ── Zoom handler: shrink edges and arrows as you zoom in ─────────────
         var zoomTimer = null;
