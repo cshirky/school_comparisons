@@ -36,9 +36,9 @@ html, body { margin: 0; height: 100%; font: 13px Arial, sans-serif; color: #222;
 #dataStatus { color: #666; font-size: 12px; line-height: 1.5; border-top: 1px solid #ddd; padding-top: 6px; }
 #dataStatus button { font: 12px Arial, sans-serif; margin-top: 4px; }
 #tip {
-    position: fixed; background: #fff; border: 1px solid #aaa; border-radius: 5px;
+    position: fixed; top: 12px; right: 12px; background: #fff; border: 1px solid #aaa; border-radius: 5px;
     padding: 8px 10px; font: 12px Arial, sans-serif; line-height: 1.7;
-    max-height: 500px; overflow-y: auto; z-index: 10000; display: none;
+    max-height: calc(100vh - 90px); overflow-y: auto; z-index: 10000; display: none;
     box-shadow: 0 3px 10px rgba(0,0,0,0.18); pointer-events: none; white-space: nowrap;
 }
 #targetLabels { position: fixed; inset: 0; pointer-events: none; z-index: 9000; overflow: hidden; }
@@ -637,15 +637,6 @@ var IPEDS = (function () {
             }).join('<br>');
         }
 
-        var mX = 0, mY = 0;
-        function placeTip() {
-            tipEl.style.left = (mX + 18) + 'px';
-            tipEl.style.top  = Math.max(4, Math.min(mY - 10, window.innerHeight - tipEl.offsetHeight - 10)) + 'px';
-        }
-        document.addEventListener('mousemove', function (e) {
-            mX = e.clientX; mY = e.clientY;
-            if (tipEl.style.display !== 'none') placeTip();
-        });
         // Name labels beside each visible school the hovered school lists
         var labelsEl = document.getElementById('targetLabels'), labelled = [];
         function placeLabels() {
@@ -673,7 +664,6 @@ var IPEDS = (function () {
         network.on('hoverNode', function (p) {
             tipEl.innerHTML = buildTipHTML(String(p.node));
             tipEl.style.display = 'block';
-            placeTip();
             showLabels(String(p.node));
         });
         network.on('blurNode', function () {
